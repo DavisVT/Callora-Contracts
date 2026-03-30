@@ -266,3 +266,159 @@ fn batch_distribute_success_events() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Coverage gap tests
+// ---------------------------------------------------------------------------
+
+#[test]
+#[should_panic(expected = "unauthorized: caller is not admin")]
+fn distribute_non_admin_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let attacker = Address::generate(&env);
+    let developer = Address::generate(&env);
+    let (pool_addr, client) = create_pool(&env);
+    let (usdc_address, _, usdc_admin) = create_usdc(&env, &admin);
+
+    client.init(&admin, &usdc_address);
+    fund_pool(&usdc_admin, &pool_addr, 500);
+    client.distribute(&attacker, &developer, &100);
+}
+
+#[test]
+#[should_panic(expected = "unauthorized: caller is not admin")]
+fn batch_distribute_non_admin_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let attacker = Address::generate(&env);
+    let developer = Address::generate(&env);
+    let (pool_addr, client) = create_pool(&env);
+    let (usdc_address, _, usdc_admin) = create_usdc(&env, &admin);
+
+    client.init(&admin, &usdc_address);
+    fund_pool(&usdc_admin, &pool_addr, 500);
+
+    let mut payments: Vec<(Address, i128)> = Vec::new(&env);
+    payments.push_back((developer.clone(), 100_i128));
+    client.batch_distribute(&attacker, &payments);
+}
+
+#[test]
+#[should_panic(expected = "amount must be positive")]
+fn batch_distribute_zero_amount_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let developer = Address::generate(&env);
+    let (pool_addr, client) = create_pool(&env);
+    let (usdc_address, _, usdc_admin) = create_usdc(&env, &admin);
+
+    client.init(&admin, &usdc_address);
+    fund_pool(&usdc_admin, &pool_addr, 500);
+
+    let mut payments: Vec<(Address, i128)> = Vec::new(&env);
+    payments.push_back((developer.clone(), 0_i128));
+    client.batch_distribute(&admin, &payments);
+}
+
+#[test]
+#[should_panic(expected = "insufficient USDC balance")]
+fn batch_distribute_insufficient_balance_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let dev1 = Address::generate(&env);
+    let dev2 = Address::generate(&env);
+    let (pool_addr, client) = create_pool(&env);
+    let (usdc_address, _, usdc_admin) = create_usdc(&env, &admin);
+
+    client.init(&admin, &usdc_address);
+    fund_pool(&usdc_admin, &pool_addr, 100);
+
+    let mut payments: Vec<(Address, i128)> = Vec::new(&env);
+    payments.push_back((dev1.clone(), 60_i128));
+    payments.push_back((dev2.clone(), 60_i128));
+    client.batch_distribute(&admin, &payments);
+}
+
+#[test]
+#[should_panic(expected = "invalid recipient: cannot distribute to the contract itself")]
+fn distribute_to_self_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let (pool_addr, client) = create_pool(&env);
+    let (usdc_address, _, usdc_admin) = create_usdc(&env, &admin);
+
+    client.init(&admin, &usdc_address);
+    fund_pool(&usdc_admin, &pool_addr, 500);
+    client.distribute(&admin, &pool_addr, &100);
+}
+
+#[test]
+#[should_panic(expected = "unauthorized: caller is not admin")]
+fn set_admin_non_admin_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let attacker = Address::generate(&env);
+    let new_admin = Address::generate(&env);
+    let (_, client) = create_pool(&env);
+    let (usdc, _, _) = create_usdc(&env, &admin);
+
+    client.init(&admin, &usdc);
+    client.set_admin(&attacker, &new_admin);
+}
+
+#[test]
+#[should_panic(expected = "unauthorized: caller is not pending admin")]
+fn claim_admin_wrong_caller_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let new_admin = Address::generate(&env);
+    let intruder = Address::generate(&env);
+    let (_, client) = create_pool(&env);
+    let (usdc, _, _) = create_usdc(&env, &admin);
+
+    client.init(&admin, &usdc);
+    client.set_admin(&admin, &new_admin);
+    client.claim_admin(&intruder);
+}
+
+#[test]
+fn receive_payment_from_vault_emits_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let (_, client) = create_pool(&env);
+    let (usdc, _, _) = create_usdc(&env, &admin);
+
+    client.init(&admin, &usdc);
+    client.receive_payment(&admin, &200, &true);
+
+    let events = env.events().all();
+    let ev = events.last().unwrap();
+    let event_name = Symbol::try_from_val(&env, &ev.1.get(0).unwrap()).unwrap();
+    assert_eq!(event_name, Symbol::new(&env, "receive_payment"));
+}
+
+#[test]
+#[should_panic(expected = "invalid recipient: cannot distribute to the contract itself")]
+fn batch_distribute_to_self_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let (pool_addr, client) = create_pool(&env);
+    let (usdc_address, _, usdc_admin) = create_usdc(&env, &admin);
+
+    client.init(&admin, &usdc_address);
+    fund_pool(&usdc_admin, &pool_addr, 500);
+
+    let mut payments: Vec<(Address, i128)> = Vec::new(&env);
+    payments.push_back((pool_addr.clone(), 100_i128));
+    client.batch_distribute(&admin, &payments);
+}

@@ -2141,3 +2141,278 @@ fn non_owner_cannot_clear_allowed_depositors() {
     let result = client.try_clear_allowed_depositors(&attacker);
     assert!(result.is_err(), "non-owner must not clear allowlist");
 }
+
+// ---------------------------------------------------------------------------
+// Read-only API completeness tests (issue #112)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn balance_before_init_fails() {
+    let env = Env::default();
+    let (_, client) = create_vault(&env);
+    assert!(client.try_balance().is_err(), "balance must fail before init");
+}
+
+#[test]
+fn get_max_deduct_returns_default_when_not_set() {
+    let env = Env::default();
+    let owner = Address::generate(&env);
+    let (_, client) = create_vault(&env);
+    let (usdc, _, _) = create_usdc(&env, &owner);
+
+    env.mock_all_auths();
+    client.init(&owner, &usdc, &None, &None, &None, &None, &None);
+
+    assert_eq!(client.get_max_deduct(), i128::MAX);
+}
+
+#[test]
+fn get_max_deduct_returns_configured_value() {
+    let env = Env::default();
+    let owner = Address::generate(&env);
+    let (_, client) = create_vault(&env);
+    let (usdc, _, _) = create_usdc(&env, &owner);
+
+    env.mock_all_auths();
+    client.init(&owner, &usdc, &None, &None, &None, &None, &Some(500));
+
+    assert_eq!(client.get_max_deduct(), 500);
+}
+
+#[test]
+fn get_max_deduct_before_init_returns_default() {
+    // get_max_deduct must not panic before init — returns DEFAULT_MAX_DEDUCT.
+    let env = Env::default();
+    let (_, client) = create_vault(&env);
+    assert_eq!(client.get_max_deduct(), i128::MAX);
+}
+
+#[test]
+fn is_paused_before_init_returns_false() {
+    // is_paused must not panic before init — returns false.
+    let env = Env::default();
+    let (_, client) = create_vault(&env);
+    assert!(!client.is_paused());
+}
+
+#[test]
+fn deduct_exceeds_max_deduct_fails() {
+    let env = Env::default();
+    let owner = Address::generate(&env);
+    let (vault_address, client) = create_vault(&env);
+    let (usdc, _, usdc_admin) = create_usdc(&env, &owner);
+
+    env.mock_all_auths();
+    fund_vault(&usdc_admin, &vault_address, 1000);
+    client.init(&owner, &usdc, &Some(1000), &None, &None, &None, &Some(100));
+
+    let result = client.try_deduct(&owner, &101, &None);
+    assert!(result.is_err(), "expected error when deduct exceeds max_deduct");
+    assert_eq!(client.balance(), 1000);
+}
+
+#[test]
+fn get_allowed_depositors_empty_before_any_set() {
+    let env = Env::default();
+    let owner = Address::generate(&env);
+    let (_, client) = create_vault(&env);
+    let (usdc, _, _) = create_usdc(&env, &owner);
+
+    env.mock_all_auths();
+    client.init(&owner, &usdc, &None, &None, &None, &None, &None);
+
+    assert_eq!(client.get_allowed_depositors().len(), 0);
+}
+
+#[test]
+fn get_metadata_returns_none_when_not_set() {
+    let env = Env::default();
+    let owner = Address::generate(&env);
+    let (_, client) = create_vault(&env);
+    let (usdc, _, _) = create_usdc(&env, &owner);
+
+    env.mock_all_auths();
+    client.init(&owner, &usdc, &None, &None, &None, &None, &None);
+
+    let result = client.get_metadata(&String::from_str(&env, "nonexistent"));
+    assert_eq!(result, None);
+}
+
+// ---------------------------------------------------------------------------
+// Coverage gap tests — target uncovered branches in lib.rs
+// ---------------------------------------------------------------------------
+
+#[test]
+fn set_admin_non_admin_caller_fails() {
+    let env = Env::default();
+    let owner = Address::generate(&env);
+    let intruder = Address::generate(&env);
+    let new_admin = Address::generate(&env);
+    let (vault_address, client) = create_vault(&env);
+    let (usdc, _, usdc_admin) = create_usdc(&env, &owner);
+
+    env.mock_all_auths();
+    fund_vault(&usdc_admin, &vault_address, 100);
+    client.init(&owner, &usdc, &Some(100), &None, &None, &None, &None);
+
+    let result = client.try_set_admin(&intruder, &new_admin);
+    assert!(result.is_err());
+}
+
+#[test]
+fn accept_admin_without_pending_fails() {
+    let env = Env::default();
+    let owner = Address::generate(&env);
+    let (vault_address, client) = create_vault(&env);
+    let (usdc, _, usdc_admin) = create_usdc(&env, &owner);
+
+    env.mock_all_auths();
+    fund_vault(&usdc_admin, &vault_address, 100);
+    client.init(&owner, &usdc, &Some(100), &None, &None, &None, &None);
+
+    let result = client.try_accept_admin();
+    assert!(result.is_err());
+}
+
+#[test]
+fn accept_ownership_without_pending_fails() {
+    let env = Env::default();
+    let owner = Address::generate(&env);
+    let (vault_address, client) = create_vault(&env);
+    let (usdc, _, usdc_admin) = create_usdc(&env, &owner);
+
+    env.mock_all_auths();
+    fund_vault(&usdc_admin, &vault_address, 100);
+    client.init(&owner, &usdc, &Some(100), &None, &None, &None, &None);
+
+    let result = client.try_accept_ownership();
+    assert!(result.is_err());
+}
+
+#[test]
+fn deduct_unauthorized_caller_with_authorized_caller_set_fails() {
+    let env = Env::default();
+    let owner = Address::generate(&env);
+    let authorized = Address::generate(&env);
+    let intruder = Address::generate(&env);
+    let (vault_address, client) = create_vault(&env);
+    let (usdc, _, usdc_admin) = create_usdc(&env, &owner);
+
+    env.mock_all_auths();
+    fund_vault(&usdc_admin, &vault_address, 500);
+    client.init(&owner, &usdc, &Some(500), &Some(authorized), &None, &None, &None);
+
+    let result = client.try_deduct(&intruder, &100, &None);
+    assert!(result.is_err());
+    assert_eq!(client.balance(), 500);
+}
+
+#[test]
+fn batch_deduct_unauthorized_caller_with_authorized_caller_set_fails() {
+    let env = Env::default();
+    let owner = Address::generate(&env);
+    let authorized = Address::generate(&env);
+    let intruder = Address::generate(&env);
+    let (vault_address, client) = create_vault(&env);
+    let (usdc, _, usdc_admin) = create_usdc(&env, &owner);
+
+    env.mock_all_auths();
+    fund_vault(&usdc_admin, &vault_address, 500);
+    client.init(&owner, &usdc, &Some(500), &Some(authorized), &None, &None, &None);
+
+    let items = soroban_sdk::vec![&env, DeductItem { amount: 100, request_id: None }];
+    let result = client.try_batch_deduct(&intruder, &items);
+    assert!(result.is_err());
+    assert_eq!(client.balance(), 500);
+}
+
+#[test]
+fn withdraw_negative_amount_fails() {
+    let env = Env::default();
+    let owner = Address::generate(&env);
+    let (vault_address, client) = create_vault(&env);
+    let (usdc, _, usdc_admin) = create_usdc(&env, &owner);
+
+    env.mock_all_auths();
+    fund_vault(&usdc_admin, &vault_address, 100);
+    client.init(&owner, &usdc, &Some(100), &None, &None, &None, &None);
+
+    let result = client.try_withdraw(&-10);
+    assert!(result.is_err());
+}
+
+#[test]
+fn withdraw_to_negative_amount_fails() {
+    let env = Env::default();
+    let owner = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let (vault_address, client) = create_vault(&env);
+    let (usdc, _, usdc_admin) = create_usdc(&env, &owner);
+
+    env.mock_all_auths();
+    fund_vault(&usdc_admin, &vault_address, 100);
+    client.init(&owner, &usdc, &Some(100), &None, &None, &None, &None);
+
+    let result = client.try_withdraw_to(&recipient, &-10);
+    assert!(result.is_err());
+}
+
+#[test]
+fn pause_already_paused_fails() {
+    let env = Env::default();
+    let owner = Address::generate(&env);
+    let (_, client) = create_vault(&env);
+    let (usdc, _, _) = create_usdc(&env, &owner);
+
+    env.mock_all_auths();
+    client.init(&owner, &usdc, &None, &None, &None, &None, &None);
+    client.pause(&owner);
+
+    let result = client.try_pause(&owner);
+    assert!(result.is_err());
+}
+
+#[test]
+fn unpause_not_paused_fails() {
+    let env = Env::default();
+    let owner = Address::generate(&env);
+    let (_, client) = create_vault(&env);
+    let (usdc, _, _) = create_usdc(&env, &owner);
+
+    env.mock_all_auths();
+    client.init(&owner, &usdc, &None, &None, &None, &None, &None);
+
+    let result = client.try_unpause(&owner);
+    assert!(result.is_err());
+}
+
+#[test]
+fn update_metadata_exceeds_length_fails() {
+    let env = Env::default();
+    let owner = Address::generate(&env);
+    let (_, client) = create_vault(&env);
+    let (usdc, _, _) = create_usdc(&env, &owner);
+
+    env.mock_all_auths();
+    client.init(&owner, &usdc, &None, &None, &None, &None, &None);
+
+    let offering_id = String::from_str(&env, "off-1");
+    let too_long = String::from_str(&env, "b".repeat(257).as_str());
+    let result = client.try_update_metadata(&owner, &offering_id, &too_long);
+    assert!(result.is_err());
+}
+
+#[test]
+fn update_metadata_offering_id_exceeds_length_fails() {
+    let env = Env::default();
+    let owner = Address::generate(&env);
+    let (_, client) = create_vault(&env);
+    let (usdc, _, _) = create_usdc(&env, &owner);
+
+    env.mock_all_auths();
+    client.init(&owner, &usdc, &None, &None, &None, &None, &None);
+
+    let too_long_id = String::from_str(&env, "a".repeat(65).as_str());
+    let result = client.try_update_metadata(&owner, &too_long_id, &String::from_str(&env, "meta"));
+    assert!(result.is_err());
+}

@@ -108,6 +108,8 @@ impl CalloraVault {
         list.contains(&caller)
     }
 
+    /// Returns the current admin address.
+    /// Panics with `"vault not initialized"` if called before `init`.
     pub fn get_admin(env: Env) -> Address {
         env.storage()
             .instance()
@@ -171,6 +173,8 @@ impl CalloraVault {
             .publish((Symbol::new(&env, "distribute"), to), amount);
     }
 
+    /// Returns the full `VaultMeta` (owner, balance, authorized_caller, min_deposit).
+    /// Panics with `"vault not initialized"` if called before `init`.
     pub fn get_meta(env: Env) -> VaultMeta {
         env.storage()
             .instance()
@@ -220,6 +224,7 @@ impl CalloraVault {
             .set(&StorageKey::DepositorList, &Vec::<Address>::new(&env));
     }
 
+    /// Returns the list of addresses allowed to deposit. Empty when none are set.
     pub fn get_allowed_depositors(env: Env) -> Vec<Address> {
         env.storage()
             .instance()
@@ -256,6 +261,8 @@ impl CalloraVault {
             .publish((Symbol::new(&env, "vault_unpaused"), caller), ());
     }
 
+    /// Returns `true` if the vault circuit-breaker is active, `false` otherwise.
+    /// Safe to call before `init`; returns `false` when uninitialized.
     pub fn is_paused(env: Env) -> bool {
         env.storage()
             .instance()
@@ -263,6 +270,8 @@ impl CalloraVault {
             .unwrap_or(false)
     }
 
+    /// Returns the maximum amount allowed per single `deduct` call.
+    /// Returns `i128::MAX` (no cap) when uninitialized or when no cap was set at `init`.
     pub fn get_max_deduct(env: Env) -> i128 {
         env.storage()
             .instance()
@@ -378,6 +387,8 @@ impl CalloraVault {
         meta.balance
     }
 
+    /// Returns the current tracked USDC balance.
+    /// Panics with `"vault not initialized"` if called before `init`.
     pub fn balance(env: Env) -> i128 {
         Self::get_meta(env).balance
     }
@@ -484,6 +495,7 @@ impl CalloraVault {
         }
     }
 
+    /// Returns the revenue pool address, or `None` if not configured.
     pub fn get_revenue_pool(env: Env) -> Option<Address> {
         env.storage().instance().get(&StorageKey::RevenuePool)
     }
@@ -499,6 +511,8 @@ impl CalloraVault {
             .set(&StorageKey::Settlement, &settlement_address);
     }
 
+    /// Returns the settlement contract address.
+    /// Panics with `"settlement address not set"` if not configured.
     pub fn get_settlement(env: Env) -> Address {
         env.storage()
             .instance()
@@ -532,6 +546,7 @@ impl CalloraVault {
         metadata
     }
 
+    /// Returns the metadata string for the given `offering_id`, or `None` if not set.
     pub fn get_metadata(env: Env, offering_id: String) -> Option<String> {
         env.storage()
             .instance()
