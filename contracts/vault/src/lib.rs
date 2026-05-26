@@ -381,21 +381,6 @@ impl CalloraVault {
             .unwrap_or(Vec::new(&env))
     }
 
-    pub fn set_authorized_caller(env: Env, new_caller: Option<Address>) {
-        let mut meta = Self::get_meta(env.clone());
-        meta.owner.require_auth();
-        let old_authorized_caller = meta.authorized_caller.clone();
-        meta.authorized_caller = caller.clone();
-        env.storage().instance().set(&StorageKey::MetaKey, &meta);
-        env.events().publish(
-            (
-                Symbol::new(&env, "set_authorized_caller"),
-                meta.owner.clone(),
-            ),
-            (old_authorized_caller, caller),
-        );
-    }
-
     pub fn pause(env: Env, caller: Address) {
         caller.require_auth();
         Self::require_admin_or_owner(env.clone(), &caller);
@@ -667,44 +652,6 @@ impl CalloraVault {
             .publish((Symbol::new(&env, "distribute"), to), amount);
     }
 
-    pub fn transfer_ownership(env: Env, new_owner: Address) {
-        let meta = Self::get_meta(env.clone());
-        meta.owner.require_auth();
-        assert!(
-            new_owner != meta.owner,
-            "new_owner must be different from current owner"
-        );
-        env.storage()
-            .instance()
-            .set(&StorageKey::PendingOwner, &new_owner);
-        env.events().publish(
-            (
-                Symbol::new(&env, "ownership_nominated"),
-                meta.owner,
-                new_owner,
-            ),
-            (),
-        );
-    }
-
-    pub fn accept_ownership(env: Env) {
-        let pending: Address = env
-            .storage()
-            .instance()
-            .get(&StorageKey::PendingOwner)
-            .expect("no ownership transfer pending");
-        pending.require_auth();
-        let mut meta = Self::get_meta(env.clone());
-        let old = meta.owner.clone();
-        meta.owner = pending;
-        env.storage().instance().set(&StorageKey::MetaKey, &meta);
-        env.storage().instance().remove(&StorageKey::PendingOwner);
-        env.events().publish(
-            (Symbol::new(&env, "ownership_accepted"), old, meta.owner),
-            (),
-        );
-    }
-
     pub fn set_revenue_pool(env: Env, caller: Address, revenue_pool: Option<Address>) {
         caller.require_auth();
         let admin = Self::get_admin(env.clone());
@@ -861,21 +808,6 @@ impl CalloraVault {
         );
     }
 
-    pub fn add_address(env: Env, caller: Address, depositor: Address) {
-        Self::set_allowed_depositor(env.clone(), caller.clone(), Some(depositor.clone()));
-        env.events()
-            .publish((Symbol::new(&env, "allowlist_add"), caller, depositor), ());
-    }
-
-    pub fn get_allowlist(env: Env) -> Vec<Address> {
-        Self::get_allowed_depositors(env)
-    }
-
-    pub fn clear_all(env: Env, caller: Address) {
-        Self::clear_allowed_depositors(env.clone(), caller.clone());
-        env.events()
-            .publish((Symbol::new(&env, "allowlist_clear"), caller), ());
-    }
 }
 
 // Allowlist aliases used by tests

@@ -72,6 +72,7 @@ impl CalloraSettlement {
     /// # Panics
     /// Panics if the contract is already initialized.
     pub fn init(env: Env, admin: Address, vault_address: Address) {
+        admin.require_auth();
         let inst = env.storage().instance();
         if inst.has(&Symbol::new(&env, ADMIN_KEY)) {
             panic!("settlement contract already initialized");
