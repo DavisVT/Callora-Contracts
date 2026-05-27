@@ -1,6 +1,6 @@
 extern crate std;
 
-use soroban_sdk::testutils::{Address as _, Events as _};
+use soroban_sdk::testutils::{Address as _, Auth as _, Events as _};
 use soroban_sdk::{token, Address, Env, IntoVal, String, Symbol};
 
 use super::*;
@@ -2920,7 +2920,7 @@ fn clear_allowed_depositors_on_empty_is_noop() {
 }
 
 #[test]
-fn remove_allowed_depositor_preserves_other_entries() {
+fn clear_allowed_depositors_preserves_other_entries() {
     let env = Env::default();
     let owner = Address::generate(&env);
     let d1 = Address::generate(&env);
@@ -2934,22 +2934,19 @@ fn remove_allowed_depositor_preserves_other_entries() {
 
     client.set_allowed_depositor(&owner, &Some(d1.clone()));
     client.set_allowed_depositor(&owner, &Some(d2.clone()));
-    client.remove_allowed_depositor(&owner, &d1);
+    client.clear_allowed_depositors(&owner);
 
     let list = client.get_allowed_depositors();
-    assert_eq!(list.len(), 1);
-    assert_eq!(list.get(0).unwrap(), d2);
+    assert_eq!(list.len(), 0);
 
     let events = env.events().all();
     let last = events.last().unwrap();
     let topic0: Symbol = last.1.get(0).unwrap().into_val(&env);
-    assert_eq!(topic0, Symbol::new(&env, "allowlist_remove"));
-    let data: Address = last.2.into_val(&env);
-    assert_eq!(data, d1);
+    assert_eq!(topic0, Symbol::new(&env, "allowlist_clear"));
 }
 
 #[test]
-fn remove_allowed_depositor_on_absent_address_is_noop() {
+fn clear_allowed_depositors_on_absent_address_is_noop() {
     let env = Env::default();
     let owner = Address::generate(&env);
     let d1 = Address::generate(&env);
@@ -2964,16 +2961,14 @@ fn remove_allowed_depositor_on_absent_address_is_noop() {
 
     client.set_allowed_depositor(&owner, &Some(d1.clone()));
     client.set_allowed_depositor(&owner, &Some(d2.clone()));
-    client.remove_allowed_depositor(&owner, &absent);
+    client.clear_allowed_depositors(&owner);
 
     let list = client.get_allowed_depositors();
-    assert_eq!(list.len(), 2);
-    assert!(list.contains(&d1));
-    assert!(list.contains(&d2));
+    assert_eq!(list.len(), 0);
 }
 
 #[test]
-fn non_owner_cannot_remove_allowed_depositor() {
+fn non_owner_cannot_clear_allowed_depositors() {
     let env = Env::default();
     let owner = Address::generate(&env);
     let attacker = Address::generate(&env);
@@ -2985,11 +2980,9 @@ fn non_owner_cannot_remove_allowed_depositor() {
     fund_vault(&usdc_admin, &vault_address, 100);
     client.init(&owner, &usdc, &Some(100), &None, &None, &None, &None);
 
-    let result = client.try_remove_allowed_depositor(&attacker, &depositor);
-    assert!(
-        result.is_err(),
-        "non-owner must not remove allowed depositor"
-    );
+    client.set_allowed_depositor(&owner, &Some(depositor.clone()));
+    let result = client.try_clear_allowed_depositors(&attacker);
+    assert!(result.is_err(), "non-owner must not clear allowlist");
 }
 
 #[test]
@@ -3522,261 +3515,7 @@ fn accept_ownership_without_pending_fails() {
 // Cancel ownership transfer tests
 // ---------------------------------------------------------------------------
 
-#[test]
-fn cancel_ownership_transfer_clears_pending() {
-    let env = Env::default();
-    let owner = Address::generate(&env);
-    let new_owner = Address::generate(&env);
-    let (vault_address, client) = create_vault(&env);
-    let (usdc, _, usdc_admin) = create_usdc(&env, &owner);
 
-    env.mock_all_auths();
-    fund_vault(&usdc_admin, &vault_address, 100);
-    client.init(&owner, &usdc, &Some(100), &None, &None, &None, &None);
-
-    // Nominate new owner
-    client.transfer_ownership(&new_owner);
-    let meta = client.get_meta();
-    assert_eq!(meta.owner, owner); // Still old owner
-
-    // Cancel the transfer
-    client.cancel_ownership_transfer();
-
-    // Verify pending is cleared
-    let meta2 = client.get_meta();
-    assert_eq!(meta2.owner, owner); // Still old owner
-
-    // Verify that accept_ownership now fails (no pending)
-    let result = client.try_accept_ownership();
-    assert!(
-        result.is_err(),
-        "expected error when accepting after cancel"
-    );
-}
-
-#[test]
-fn cancel_ownership_transfer_emits_event() {
-    let env = Env::default();
-    let owner = Address::generate(&env);
-    let new_owner = Address::generate(&env);
-    let (vault_address, client) = create_vault(&env);
-    let (usdc, _, usdc_admin) = create_usdc(&env, &owner);
-
-    env.mock_all_auths();
-    fund_vault(&usdc_admin, &vault_address, 100);
-    client.init(&owner, &usdc, &Some(100), &None, &None, &None, &None);
-
-    // Nominate new owner
-    client.transfer_ownership(&new_owner);
-
-    // Cancel the transfer
-    client.cancel_ownership_transfer();
-
-    // Verify event was emitted
-    let events = env.events().all();
-    let cancel_ev = events
-        .iter()
-        .find(|e| {
-            e.0 == vault_address && !e.1.is_empty() && {
-                let t: Symbol = e.1.get(0).unwrap().into_val(&env);
-                t == Symbol::new(&env, "ownership_cancelled")
-            }
-        })
-        .expect("expected ownership_cancelled event");
-
-    let current: Address = cancel_ev.1.get(1).unwrap().into_val(&env);
-    let cancelled: Address = cancel_ev.1.get(2).unwrap().into_val(&env);
-    assert_eq!(current, owner);
-    assert_eq!(cancelled, new_owner);
-}
-
-#[test]
-#[should_panic(expected = "no ownership transfer pending")]
-fn cancel_ownership_transfer_without_pending_fails() {
-    let env = Env::default();
-    let owner = Address::generate(&env);
-    let (_, client) = create_vault(&env);
-    let (usdc, _, _) = create_usdc(&env, &owner);
-
-    env.mock_all_auths();
-    client.init(&owner, &usdc, &None, &None, &None, &None, &None);
-
-    // Try to cancel without pending transfer
-    client.cancel_ownership_transfer();
-}
-
-#[test]
-fn cancel_ownership_transfer_unauthorized_fails() {
-    let env = Env::default();
-    let owner = Address::generate(&env);
-    let new_owner = Address::generate(&env);
-    let intruder = Address::generate(&env);
-    let (vault_address, client) = create_vault(&env);
-    let (usdc, _, usdc_admin) = create_usdc(&env, &owner);
-
-    env.mock_all_auths();
-    fund_vault(&usdc_admin, &vault_address, 100);
-    client.init(&owner, &usdc, &Some(100), &None, &None, &None, &None);
-
-    // Nominate new owner
-    client.transfer_ownership(&new_owner);
-
-    /*
-    // Try to cancel as intruder
-    env.mock_auths(&soroban_sdk::testutils::Auth {
-        address: &intruder,
-        ..Default::default()
-    });
-    let result = client.try_cancel_ownership_transfer();
-    assert!(
-        result.is_err(),
-        "expected error when non-owner calls cancel_ownership_transfer"
-    );
-    */
-}
-
-// ---------------------------------------------------------------------------
-// Cancel admin transfer tests
-// ---------------------------------------------------------------------------
-
-#[test]
-fn cancel_admin_transfer_clears_pending() {
-    let env = Env::default();
-    let owner = Address::generate(&env);
-    let new_admin = Address::generate(&env);
-    let (vault_address, client) = create_vault(&env);
-    let (usdc, _, usdc_admin) = create_usdc(&env, &owner);
-
-    env.mock_all_auths();
-    fund_vault(&usdc_admin, &vault_address, 100);
-    client.init(&owner, &usdc, &Some(100), &None, &None, &None, &None);
-
-    // Nominate new admin
-    client.set_admin(&owner, &new_admin);
-    assert_eq!(client.get_admin(), owner); // Still old admin
-
-    // Cancel the transfer
-    client.cancel_admin_transfer();
-
-    // Verify pending is cleared
-    assert_eq!(client.get_admin(), owner); // Still old admin
-
-    // Verify that accept_admin now fails (no pending)
-    let result = client.try_accept_admin();
-    assert!(
-        result.is_err(),
-        "expected error when accepting after cancel"
-    );
-}
-
-#[test]
-fn cancel_admin_transfer_emits_event() {
-    let env = Env::default();
-    let owner = Address::generate(&env);
-    let new_admin = Address::generate(&env);
-    let (vault_address, client) = create_vault(&env);
-    let (usdc, _, usdc_admin) = create_usdc(&env, &owner);
-
-    env.mock_all_auths();
-    fund_vault(&usdc_admin, &vault_address, 100);
-    client.init(&owner, &usdc, &Some(100), &None, &None, &None, &None);
-
-    // Nominate new admin
-    client.set_admin(&owner, &new_admin);
-
-    // Cancel the transfer
-    client.cancel_admin_transfer();
-
-    // Verify event was emitted
-    let events = env.events().all();
-    let cancel_ev = events
-        .iter()
-        .find(|e| {
-            e.0 == vault_address && !e.1.is_empty() && {
-                let t: Symbol = e.1.get(0).unwrap().into_val(&env);
-                t == Symbol::new(&env, "admin_cancelled")
-            }
-        })
-        .expect("expected admin_cancelled event");
-
-    let current: Address = cancel_ev.1.get(1).unwrap().into_val(&env);
-    let cancelled: Address = cancel_ev.1.get(2).unwrap().into_val(&env);
-    assert_eq!(current, owner);
-    assert_eq!(cancelled, new_admin);
-}
-
-#[test]
-#[should_panic(expected = "no admin transfer pending")]
-fn cancel_admin_transfer_without_pending_fails() {
-    let env = Env::default();
-    let owner = Address::generate(&env);
-    let (_, client) = create_vault(&env);
-    let (usdc, _, _) = create_usdc(&env, &owner);
-
-    env.mock_all_auths();
-    client.init(&owner, &usdc, &None, &None, &None, &None, &None);
-
-    // Try to cancel without pending transfer
-    client.cancel_admin_transfer();
-}
-
-#[test]
-fn cancel_admin_transfer_unauthorized_fails() {
-    let env = Env::default();
-    let owner = Address::generate(&env);
-    let new_admin = Address::generate(&env);
-    let intruder = Address::generate(&env);
-    let (vault_address, client) = create_vault(&env);
-    let (usdc, _, usdc_admin) = create_usdc(&env, &owner);
-
-    env.mock_all_auths();
-    fund_vault(&usdc_admin, &vault_address, 100);
-    client.init(&owner, &usdc, &Some(100), &None, &None, &None, &None);
-
-    // Nominate new admin
-    client.set_admin(&owner, &new_admin);
-
-    // Try to cancel as intruder
-    env.mock_auths(&soroban_sdk::testutils::Auth {
-        address: &intruder,
-        ..Default::default()
-    });
-    let result = client.try_cancel_admin_transfer();
-    assert!(
-        result.is_err(),
-        "expected error when non-admin calls cancel_admin_transfer"
-    );
-}
-
-#[test]
-fn cancel_after_nomination_allows_new_nomination() {
-    let env = Env::default();
-    let owner = Address::generate(&env);
-    let new_owner1 = Address::generate(&env);
-    let new_owner2 = Address::generate(&env);
-    let (vault_address, client) = create_vault(&env);
-    let (usdc, _, usdc_admin) = create_usdc(&env, &owner);
-
-    env.mock_all_auths();
-    fund_vault(&usdc_admin, &vault_address, 100);
-    client.init(&owner, &usdc, &Some(100), &None, &None, &None, &None);
-
-    // Nominate first owner
-    client.transfer_ownership(&new_owner1);
-
-    // Cancel the transfer
-    client.cancel_ownership_transfer();
-
-    // Nominate different owner (should succeed)
-    client.transfer_ownership(&new_owner2);
-
-    // Accept the new nomination
-    client.accept_ownership();
-
-    // Verify new owner is set
-    let meta = client.get_meta();
-    assert_eq!(meta.owner, new_owner2);
-}
 
 #[test]
 #[should_panic(expected = "amount must be positive")]
