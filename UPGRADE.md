@@ -107,9 +107,9 @@ pub fn init(
 
 #### Upgradeability
 
-The revenue pool exposes an admin-gated `upgrade(env, caller, new_wasm_hash: BytesN<32>)`
-entrypoint which calls the host deployer to update the contract WASM and stores the
-`version` (WASM hash) in instance storage. Usage:
+The revenue pool now supports in-place upgrades via an admin-gated `upgrade` function. 
+This method calls the host deployer to update the contract WASM code while 
+preserving existing instance storage.
 
 ```bash
 # Build new WASM
