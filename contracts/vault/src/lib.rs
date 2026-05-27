@@ -214,6 +214,16 @@ impl CalloraVault {
         env.storage().instance().get(&StorageKey::RevenuePool)
     }
 
+    /// Return the pending owner address, or `None` if no ownership transfer is in progress.
+    pub fn get_pending_owner(env: Env) -> Option<Address> {
+        env.storage().instance().get(&StorageKey::PendingOwner)
+    }
+
+    /// Return the pending admin address, or `None` if no admin transfer is in progress.
+    pub fn get_pending_admin(env: Env) -> Option<Address> {
+        env.storage().instance().get(&StorageKey::PendingAdmin)
+    }
+
     /// Return `(usdc_token, settlement, revenue_pool)` in one call.
     /// Useful for operators verifying deployment configuration.
     pub fn get_contract_addresses(env: Env) -> (Option<Address>, Option<Address>, Option<Address>) {

@@ -3392,6 +3392,85 @@ fn is_paused_safe_default_before_init() {
     assert!(!client.is_paused());
 }
 
+// ---------------------------------------------------------------------------
+// get_pending_owner / get_pending_admin tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn get_pending_owner_returns_none_before_transfer() {
+    let env = Env::default();
+    let owner = Address::generate(&env);
+    let (_, client) = create_vault(&env);
+    let (usdc, _, _) = create_usdc(&env, &owner);
+
+    env.mock_all_auths();
+    client.init(&owner, &usdc, &None, &None, &None, &None, &None);
+
+    // Before any transfer_ownership call, should return None
+    assert_eq!(client.get_pending_owner(), None);
+}
+
+#[test]
+fn get_pending_owner_returns_some_after_transfer() {
+    let env = Env::default();
+    let owner = Address::generate(&env);
+    let new_owner = Address::generate(&env);
+    let (vault_address, client) = create_vault(&env);
+    let (usdc, _, usdc_admin) = create_usdc(&env, &owner);
+
+    env.mock_all_auths();
+    fund_vault(&usdc_admin, &vault_address, 100);
+    client.init(&owner, &usdc, &Some(100), &None, &None, &None, &None);
+
+    // Before transfer_ownership
+    assert_eq!(client.get_pending_owner(), None);
+
+    // After transfer_ownership
+    client.transfer_ownership(&new_owner);
+    assert_eq!(client.get_pending_owner(), Some(new_owner.clone()));
+
+    // After accept_ownership, pending should be cleared
+    client.accept_ownership();
+    assert_eq!(client.get_pending_owner(), None);
+}
+
+#[test]
+fn get_pending_admin_returns_none_before_transfer() {
+    let env = Env::default();
+    let owner = Address::generate(&env);
+    let (_, client) = create_vault(&env);
+    let (usdc, _, _) = create_usdc(&env, &owner);
+
+    env.mock_all_auths();
+    client.init(&owner, &usdc, &None, &None, &None, &None, &None);
+
+    // Before any set_admin call, should return None
+    assert_eq!(client.get_pending_admin(), None);
+}
+
+#[test]
+fn get_pending_admin_returns_some_after_transfer() {
+    let env = Env::default();
+    let owner = Address::generate(&env);
+    let new_admin = Address::generate(&env);
+    let (vault_address, client) = create_vault(&env);
+    let (usdc, _, usdc_admin) = create_usdc(&env, &owner);
+
+    env.mock_all_auths();
+    fund_vault(&usdc_admin, &vault_address, 100);
+    client.init(&owner, &usdc, &Some(100), &None, &None, &None, &None);
+
+    // Before set_admin
+    assert_eq!(client.get_pending_admin(), None);
+
+    // After set_admin
+    client.set_admin(&owner, &new_admin);
+    assert_eq!(client.get_pending_admin(), Some(new_admin.clone()));
+
+    // After accept_admin, pending should be cleared
+    client.accept_admin();
+    assert_eq!(client.get_pending_admin(), None);
+}
 #[test]
 #[should_panic(expected = "vault is paused")]
 fn deduct_while_paused_fails() {
