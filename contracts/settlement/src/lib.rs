@@ -1,6 +1,39 @@
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol, Vec};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, Symbol, Vec};
+
+/// Maximum number of items allowed in a single `batch_receive_payment` call.
+pub const MAX_BATCH_SIZE: u32 = 50;
+
+/// Typed errors for the settlement contract.
+///
+/// Using `#[contracterror]` encodes each variant as a stable `u32` code.
+/// Callers and indexers can match on the code rather than parsing raw panic strings,
+/// and the WASM binary shrinks because no error string literals are embedded.
+///
+/// | Code | Variant              | When                                              |
+/// |------|----------------------|---------------------------------------------------|
+/// | 1    | NotInitialized       | A function is called before `init`                |
+/// | 2    | AlreadyInitialized   | `init` is called more than once                   |
+/// | 3    | Unauthorized         | Caller is not the vault or admin                  |
+/// | 4    | AmountNotPositive    | `amount` is zero or negative                      |
+/// | 5    | DeveloperRequired    | `to_pool=false` but no developer address supplied |
+/// | 6    | DeveloperMustBeNone  | `to_pool=true` but a developer address was given  |
+/// | 7    | PoolOverflow         | Global pool `i128` addition would overflow        |
+/// | 8    | DeveloperOverflow    | Developer balance `i128` addition would overflow  |
+#[contracterror]
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(u32)]
+pub enum SettlementError {
+    NotInitialized      = 1,
+    AlreadyInitialized  = 2,
+    Unauthorized        = 3,
+    AmountNotPositive   = 4,
+    DeveloperRequired   = 5,
+    DeveloperMustBeNone = 6,
+    PoolOverflow        = 7,
+    DeveloperOverflow   = 8,
+}
 
 /// Persistent storage keys for settlement contract
 #[contracttype]
@@ -64,14 +97,6 @@ pub struct VaultChangedEvent {
     pub new_vault: Address,
 }
 
-/// Storage key for the registered vault address.
-const VAULT_KEY: &str = "vault";
-/// Storage key for the admin address.
-const ADMIN_KEY: &str = "admin";
-const PENDING_ADMIN_KEY: &str = "pending_admin";
-const DEVELOPER_BALANCES_KEY: &str = "developer_balances";
-/// Storage key for the global pool state.
-const GLOBAL_POOL_KEY: &str = "global_pool";
 
 #[contract]
 pub struct CalloraSettlement;
@@ -86,7 +111,6 @@ impl CalloraSettlement {
     /// Storage keys written:
     /// - `StorageKey::Admin`
     /// - `StorageKey::Vault`
-    /// - `StorageKey::DeveloperIndex`
     /// - `StorageKey::GlobalPool`
     ///
     /// # Panics
@@ -98,7 +122,7 @@ impl CalloraSettlement {
         admin.require_auth();
         let inst = env.storage().instance();
         if inst.has(&StorageKey::Admin) {
-            panic!("settlement contract already initialized");
+            env.panic_with_error(SettlementError::AlreadyInitialized);
         }
         if admin == vault_address {
             panic!("invalid config: admin and vault_address must be distinct");
@@ -109,10 +133,8 @@ impl CalloraSettlement {
         if vault_address == env.current_contract_address() {
             panic!("invalid config: vault_address cannot be the contract itself");
         }
-        inst.set(&Symbol::new(&env, ADMIN_KEY), &admin);
-        inst.set(&Symbol::new(&env, VAULT_KEY), &vault_address);
-        let empty_balances: Map<Address, i128> = Map::new(&env);
-        inst.set(&Symbol::new(&env, DEVELOPER_BALANCES_KEY), &empty_balances);
+        inst.set(&StorageKey::Admin, &admin);
+        inst.set(&StorageKey::Vault, &vault_address);
         let global_pool = GlobalPool {
             total_balance: 0,
             last_updated: env.ledger().timestamp(),
@@ -156,18 +178,18 @@ impl CalloraSettlement {
         caller.require_auth();
         Self::require_authorized_caller(env.clone(), caller.clone());
         if amount <= 0 {
-            panic!("amount must be positive");
+            env.panic_with_error(SettlementError::AmountNotPositive);
         }
         let inst = env.storage().instance();
         if to_pool {
             if developer.is_some() {
-                panic!("developer address must be None when to_pool=true");
+                env.panic_with_error(SettlementError::DeveloperMustBeNone);
             }
             let mut global_pool = Self::get_global_pool(env.clone());
             global_pool.total_balance = global_pool
                 .total_balance
                 .checked_add(amount)
-                .unwrap_or_else(|| panic!("pool balance overflow"));
+                .unwrap_or_else(|| env.panic_with_error(SettlementError::PoolOverflow));
             global_pool.last_updated = env.ledger().timestamp();
             inst.set(&StorageKey::GlobalPool, &global_pool);
             env.events().publish(
@@ -181,7 +203,7 @@ impl CalloraSettlement {
             );
         } else {
             let dev_address = developer
-                .unwrap_or_else(|| panic!("developer address required when to_pool=false"));
+                .unwrap_or_else(|| env.panic_with_error(SettlementError::DeveloperRequired));
 
 
 
@@ -193,7 +215,7 @@ impl CalloraSettlement {
                 .unwrap_or(0);
             let new_balance = current_balance
                 .checked_add(amount)
-                .unwrap_or_else(|| panic!("developer balance overflow"));
+                .unwrap_or_else(|| env.panic_with_error(SettlementError::DeveloperOverflow));
             
             // Write to persistent storage with TTL extension
             env.storage()
@@ -274,17 +296,31 @@ impl CalloraSettlement {
         }
 
         let inst = env.storage().instance();
-        let mut balances: Map<Address, i128> = inst
-            .get(&Symbol::new(&env, DEVELOPER_BALANCES_KEY))
-            .unwrap_or_else(|| Map::new(&env));
 
         for item in items.iter() {
             let (dev, amount) = item;
-            let current = balances.get(dev.clone()).unwrap_or(0);
+            let current: i128 = env
+                .storage()
+                .persistent()
+                .get(&StorageKey::DeveloperBalance(dev.clone()))
+                .unwrap_or(0);
             let new_balance = current
                 .checked_add(amount)
-                .unwrap_or_else(|| panic!("developer balance overflow"));
-            balances.set(dev.clone(), new_balance);
+                .unwrap_or_else(|| env.panic_with_error(SettlementError::DeveloperOverflow));
+            env.storage()
+                .persistent()
+                .set(&StorageKey::DeveloperBalance(dev.clone()), &new_balance);
+            env.storage()
+                .persistent()
+                .extend_ttl(&StorageKey::DeveloperBalance(dev.clone()), 50000, 50000);
+            // Add to index if not already present
+            let mut index: Vec<Address> = inst
+                .get(&StorageKey::DeveloperIndex)
+                .unwrap_or_else(|| Vec::new(&env));
+            if !index.iter().any(|a| a == &dev) {
+                index.push_back(dev.clone());
+                inst.set(&StorageKey::DeveloperIndex, &index);
+            }
             env.events().publish(
                 (Symbol::new(&env, "balance_credited"), dev.clone()),
                 BalanceCreditedEvent {
@@ -294,8 +330,6 @@ impl CalloraSettlement {
                 },
             );
         }
-
-        inst.set(&Symbol::new(&env, DEVELOPER_BALANCES_KEY), &balances);
     }
 
     /// Get current admin address
@@ -303,7 +337,7 @@ impl CalloraSettlement {
         env.storage()
             .instance()
             .get(&StorageKey::Admin)
-            .unwrap_or_else(|| panic!("settlement contract not initialized"))
+            .unwrap_or_else(|| env.panic_with_error(SettlementError::NotInitialized))
     }
 
     /// Get registered vault address
@@ -311,7 +345,7 @@ impl CalloraSettlement {
         env.storage()
             .instance()
             .get(&StorageKey::Vault)
-            .unwrap_or_else(|| panic!("settlement contract not initialized"))
+            .unwrap_or_else(|| env.panic_with_error(SettlementError::NotInitialized))
     }
 
     /// Get global pool information
@@ -319,7 +353,7 @@ impl CalloraSettlement {
         env.storage()
             .instance()
             .get(&StorageKey::GlobalPool)
-            .unwrap_or_else(|| panic!("settlement contract not initialized"))
+            .unwrap_or_else(|| env.panic_with_error(SettlementError::NotInitialized))
     }
 
     /// Get developer balance
@@ -337,7 +371,7 @@ impl CalloraSettlement {
     /// Safe for all use cases; uses persistent storage with TTL.
     pub fn get_developer_balance(env: Env, developer: Address) -> i128 {
         if !env.storage().instance().has(&StorageKey::Admin) {
-            panic!("settlement contract not initialized");
+            env.panic_with_error(SettlementError::NotInitialized);
         }
         env.storage()
             .persistent()
@@ -383,7 +417,7 @@ impl CalloraSettlement {
         caller.require_auth();
         let admin = Self::get_admin(env.clone());
         if caller != admin {
-            panic!("unauthorized: caller is not admin");
+            env.panic_with_error(SettlementError::Unauthorized);
         }
         let inst = env.storage().instance();
         let index: Vec<Address> = inst
@@ -431,7 +465,7 @@ impl CalloraSettlement {
         caller.require_auth();
         let current_admin = Self::get_admin(env.clone());
         if caller != current_admin {
-            panic!("unauthorized: caller is not admin");
+            env.panic_with_error(SettlementError::Unauthorized);
         }
         env.storage()
             .instance()
@@ -502,11 +536,11 @@ impl CalloraSettlement {
         caller.require_auth();
         let current_admin = Self::get_admin(env.clone());
         if caller != current_admin {
-            panic!("unauthorized: caller is not admin");
+            env.panic_with_error(SettlementError::Unauthorized);
         }
         let inst = env.storage().instance();
         let old_vault = Self::get_vault(env.clone());
-        inst.set(&Symbol::new(&env, VAULT_KEY), &new_vault);
+        inst.set(&StorageKey::Vault, &new_vault);
 
         env.events().publish(
             (Symbol::new(&env, "vault_changed"), caller.clone()),
@@ -522,7 +556,7 @@ impl CalloraSettlement {
         let vault = Self::get_vault(env.clone());
         let admin = Self::get_admin(env.clone());
         if caller != vault && caller != admin {
-            panic!("unauthorized: caller must be vault or admin");
+            env.panic_with_error(SettlementError::Unauthorized);
         }
     }
 }
