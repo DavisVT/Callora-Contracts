@@ -56,14 +56,22 @@ pub struct BalanceCreditedEvent {
     pub new_balance: i128,
 }
 
+/// Emitted when the registered vault address is changed via `set_vault()`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct VaultChangedEvent {
+    pub old_vault: Address,
+    pub new_vault: Address,
+}
 
-
-
-
-
-
-
-
+/// Storage key for the registered vault address.
+const VAULT_KEY: &str = "vault";
+/// Storage key for the admin address.
+const ADMIN_KEY: &str = "admin";
+const PENDING_ADMIN_KEY: &str = "pending_admin";
+const DEVELOPER_BALANCES_KEY: &str = "developer_balances";
+/// Storage key for the global pool state.
+const GLOBAL_POOL_KEY: &str = "global_pool";
 
 #[contract]
 pub struct CalloraSettlement;
@@ -83,15 +91,28 @@ impl CalloraSettlement {
     ///
     /// # Panics
     /// Panics if the contract is already initialized.
+    /// Panics if admin and vault_address are the same.
+    /// Panics if admin is the contract's own address.
+    /// Panics if vault_address is the contract's own address.
     pub fn init(env: Env, admin: Address, vault_address: Address) {
+        admin.require_auth();
         let inst = env.storage().instance();
         if inst.has(&StorageKey::Admin) {
             panic!("settlement contract already initialized");
         }
-        inst.set(&StorageKey::Admin, &admin);
-        inst.set(&StorageKey::Vault, &vault_address);
-        let empty_index: Vec<Address> = Vec::new(&env);
-        inst.set(&StorageKey::DeveloperIndex, &empty_index);
+        if admin == vault_address {
+            panic!("invalid config: admin and vault_address must be distinct");
+        }
+        if admin == env.current_contract_address() {
+            panic!("invalid config: admin cannot be the contract itself");
+        }
+        if vault_address == env.current_contract_address() {
+            panic!("invalid config: vault_address cannot be the contract itself");
+        }
+        inst.set(&Symbol::new(&env, ADMIN_KEY), &admin);
+        inst.set(&Symbol::new(&env, VAULT_KEY), &vault_address);
+        let empty_balances: Map<Address, i128> = Map::new(&env);
+        inst.set(&Symbol::new(&env, DEVELOPER_BALANCES_KEY), &empty_balances);
         let global_pool = GlobalPool {
             total_balance: 0,
             last_updated: env.ledger().timestamp(),
@@ -120,6 +141,11 @@ impl CalloraSettlement {
     ///
     /// # Events
     /// Always emits `payment_received`. Also emits `balance_credited` when `to_pool=false`.
+    ///
+    /// # Arithmetic Safety
+    /// Credits use checked arithmetic:
+    /// - Pool credits panic with `"pool balance overflow"` on `i128` overflow.
+    /// - Developer credits panic with `"developer balance overflow"` on `i128` overflow.
     pub fn receive_payment(
         env: Env,
         caller: Address,
@@ -207,6 +233,69 @@ impl CalloraSettlement {
                 },
             );
         }
+    }
+
+    /// Atomically credit multiple developer balances in a single call.
+    ///
+    /// # Arguments
+    /// * `caller` - Must be the registered vault address or admin
+    /// * `items` - Vec of `(developer_address, amount)` pairs; 1–[`MAX_BATCH_SIZE`] entries
+    ///
+    /// # Access Control
+    /// Only the registered vault address or admin can call this function.
+    ///
+    /// # Validation
+    /// All amounts must be `> 0`. Empty and oversized batches are rejected before any state change.
+    ///
+    /// # Atomicity
+    /// All validation runs before any state is written. A failure on any item leaves the
+    /// contract state unchanged.
+    ///
+    /// # Events
+    /// Emits `balance_credited` for each item in the batch.
+    ///
+    /// # Panics
+    /// * `"batch_receive_payment requires at least one item"` — empty batch
+    /// * `"batch too large"` — more than [`MAX_BATCH_SIZE`] items
+    /// * `"amount must be positive"` — any amount ≤ 0
+    /// * `"developer balance overflow"` — `i128` overflow on any developer balance
+    pub fn batch_receive_payment(env: Env, caller: Address, items: Vec<(Address, i128)>) {
+        caller.require_auth();
+        Self::require_authorized_caller(env.clone(), caller.clone());
+
+        let n = items.len();
+        assert!(n > 0, "batch_receive_payment requires at least one item");
+        assert!(n <= MAX_BATCH_SIZE, "batch too large");
+
+        // Validate all amounts before touching state.
+        for item in items.iter() {
+            let (_, amount) = item;
+            assert!(amount > 0, "amount must be positive");
+        }
+
+        let inst = env.storage().instance();
+        let mut balances: Map<Address, i128> = inst
+            .get(&Symbol::new(&env, DEVELOPER_BALANCES_KEY))
+            .unwrap_or_else(|| Map::new(&env));
+
+        for item in items.iter() {
+            let (dev, amount) = item;
+            let current = balances.get(dev.clone()).unwrap_or(0);
+            let new_balance = current
+                .checked_add(amount)
+                .unwrap_or_else(|| panic!("developer balance overflow"));
+            balances.set(dev.clone(), new_balance);
+            env.events().publish(
+                (Symbol::new(&env, "balance_credited"), dev.clone()),
+                BalanceCreditedEvent {
+                    developer: dev,
+                    amount,
+                    new_balance,
+                },
+            );
+        }
+
+        inst.set(&Symbol::new(&env, DEVELOPER_BALANCES_KEY), &balances);
     }
 
     /// Get current admin address
@@ -405,8 +494,7 @@ impl CalloraSettlement {
     /// old vault, so coordinate carefully during migrations.
     ///
     /// # Events
-    /// This function does not emit events. Monitor vault changes by
-    /// comparing the result of `get_vault()` across blocks.
+    /// Emits `vault_changed` event with the old and new vault addresses.
     ///
     /// # Panics
     /// Panics if caller is not the current admin.
@@ -416,9 +504,17 @@ impl CalloraSettlement {
         if caller != current_admin {
             panic!("unauthorized: caller is not admin");
         }
-        env.storage()
-            .instance()
-            .set(&StorageKey::Vault, &new_vault);
+        let inst = env.storage().instance();
+        let old_vault = Self::get_vault(env.clone());
+        inst.set(&Symbol::new(&env, VAULT_KEY), &new_vault);
+
+        env.events().publish(
+            (Symbol::new(&env, "vault_changed"), caller.clone()),
+            VaultChangedEvent {
+                old_vault: old_vault.clone(),
+                new_vault: new_vault.clone(),
+            },
+        );
     }
 
     /// Internal function to require authorized caller (vault or admin)

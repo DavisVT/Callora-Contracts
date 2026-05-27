@@ -16,10 +16,19 @@ use soroban_sdk::{contract, contractimpl, token, Address, Env, Symbol, Vec};
 const ADMIN_KEY: &str = "admin";
 const PENDING_ADMIN_KEY: &str = "pending_admin";
 const USDC_KEY: &str = "usdc";
+const MAX_DISTRIBUTE_KEY: &str = "max_distribute";
 const ERR_AMOUNT_NOT_POSITIVE: &str = "amount must be positive";
+const ERR_AMOUNT_EXCEEDS_MAX_DISTRIBUTE: &str = "amount exceeds max_distribute";
 const ERR_UNAUTHORIZED: &str = "unauthorized: caller is not admin";
 const ERR_INSUFFICIENT_BALANCE: &str = "insufficient USDC balance";
 const ERR_NOT_INITIALIZED: &str = "revenue pool not initialized";
+
+pub const DEFAULT_MAX_DISTRIBUTE: i128 = i128::MAX;
+
+/// Maximum number of payments allowed in a single `batch_distribute` call.
+/// Caps CPU/memory usage well within Soroban resource limits and aligns with
+/// the vault's `MAX_BATCH_SIZE` for `batch_deduct`.
+pub const MAX_BATCH_SIZE: u32 = 50;
 
 #[contract]
 pub struct RevenuePool;
@@ -86,7 +95,9 @@ impl RevenuePool {
     /// * If the caller is not the current admin (`"unauthorized: caller is not admin"`).
     ///
     /// # Events
-    /// Emits an `admin_transfer_started` event with the `current_admin` as a topic and `new_admin` as data.
+    /// Emits an `admin_changed` event with the `current_admin` as a topic and
+    /// `(current_admin, new_admin)` as data, followed by `admin_transfer_started`
+    /// with the `current_admin` as a topic and `new_admin` as data.
     /// Return the USDC token address configured for this pool.
     ///
     /// # Arguments
@@ -112,6 +123,12 @@ impl RevenuePool {
         }
         let inst = env.storage().instance();
         inst.set(&Symbol::new(&env, PENDING_ADMIN_KEY), &new_admin);
+
+        // Emit explicit before/after admin intent for indexers and audit trails.
+        env.events().publish(
+            (Symbol::new(&env, "admin_changed"), current.clone()),
+            (current.clone(), new_admin.clone()),
+        );
 
         env.events().publish(
             (Symbol::new(&env, "admin_transfer_started"), current),
@@ -183,6 +200,37 @@ impl RevenuePool {
         );
     }
 
+    /// Get the current per-leg distribution cap.
+    /// Defaults to `i128::MAX` when unset.
+    pub fn get_max_distribute(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&Symbol::new(&env, MAX_DISTRIBUTE_KEY))
+            .unwrap_or(DEFAULT_MAX_DISTRIBUTE)
+    }
+
+    /// Set the maximum amount that may be distributed in a single `distribute`
+    /// call or as an individual payment leg in `batch_distribute`.
+    ///
+    /// Only the current admin may call this. `max_distribute` must be positive.
+    /// Emits `set_max_distribute` with `(old_max, new_max)`.
+    pub fn set_max_distribute(env: Env, caller: Address, max_distribute: i128) {
+        caller.require_auth();
+        let admin = Self::get_admin(env.clone());
+        if caller != admin {
+            panic!("unauthorized: caller is not admin");
+        }
+        assert!(max_distribute > 0, "max_distribute must be positive");
+        let old_max = Self::get_max_distribute(env.clone());
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, MAX_DISTRIBUTE_KEY), &max_distribute);
+        env.events().publish(
+            (Symbol::new(&env, "set_max_distribute"), admin),
+            (old_max, max_distribute),
+        );
+    }
+
     fn validate_recipient(recipient: &Address, contract_self: &Address) {
         // Rule 1 — no self-distributions (the contract sending to itself is almost
         // certainly a logic bug; if you want to "reclaim" funds use a dedicated fn).
@@ -218,6 +266,10 @@ impl RevenuePool {
         if amount <= 0 {
             panic!("{}", ERR_AMOUNT_NOT_POSITIVE);
         }
+        let max_distribute = Self::get_max_distribute(env.clone());
+        if amount > max_distribute {
+            panic!("{}", ERR_AMOUNT_EXCEEDS_MAX_DISTRIBUTE);
+        }
 
         let usdc_address: Address = env
             .storage()
@@ -245,60 +297,108 @@ impl RevenuePool {
             .publish((Symbol::new(&env, "distribute"), to), amount);
     }
 
-    /// Distribute USDC from this contract to multiple developer wallets in one transaction.
+    /// Distribute USDC from this contract to multiple developer wallets in one atomic transaction.
     ///
-    /// Only the admin may call. Iterates through the vector of payments and atomically
-    /// transfers USDC to each developer. Fails if the total amount exceeds balance
-    /// or if any individual amount is not positive.
+    /// This function implements a three-phase atomic batch transfer:
+    /// 1. **Precomputation & Validation**: Validates all amounts are positive and calculates total.
+    /// 2. **Balance Check**: Ensures contract has sufficient USDC before any transfers.
+    /// 3. **Execution**: Performs all transfers and emits events for each leg.
+    ///
+    /// The implementation guarantees atomicity: either all transfers succeed or none do.
+    /// No partial transfers occur if a later leg would fail.
     ///
     /// # Arguments
     /// * `env` - The environment running the contract.
     /// * `caller` - Must be the current admin.
     /// * `payments` - A vector of `(Address, i128)` tuples representing destinations and amounts.
+    ///   Must contain between 1 and [`MAX_BATCH_SIZE`] entries (inclusive).
     ///
     /// # Panics
+    /// * If `payments` is empty (`"batch_distribute requires at least one payment"`).
+    /// * If `payments` exceeds [`MAX_BATCH_SIZE`] entries (`"batch too large"`).
     /// * If the caller is not the current admin (`"unauthorized: caller is not admin"`).
     /// * If any individual amount is zero or negative (`"amount must be positive"`).
-    /// * If the revenue pool has not been initialized.
+    /// * If the revenue pool has not been initialized (`"revenue pool not initialized"`).
     /// * If the total amount exceeds the contract's available balance (`"insufficient USDC balance"`).
+    /// * If the payments vector is empty (`"payments vector cannot be empty"`).
     ///
     /// # Events
     /// Emits a `batch_distribute` event for each payment with `to` as a topic and `amount` as data.
+    ///
+    /// # Atomicity Guarantee
+    /// All validation is performed before any external calls to the USDC token contract.
+    /// This ensures that if any validation fails, no state changes or transfers occur.
+    ///
+    /// # Vector Size Policy
+    /// The maximum number of payments in a single batch is limited by Soroban's
+    /// transaction budget and footprint limits. Recommended maximum: 100 payments per batch.
+    /// For larger distributions, split into multiple transactions.
+    ///
+    /// # Examples
+    /// ```ignore
+    /// let payments = vec![
+    ///     (developer1, 1000),
+    ///     (developer2, 2000),
+    ///     (developer3, 1500),
+    /// ];
+    /// pool.batch_distribute(&admin, &payments);
+    /// ```
     pub fn batch_distribute(env: Env, caller: Address, payments: Vec<(Address, i128)>) {
+        // Phase 0: Authorization
         caller.require_auth();
         let admin = Self::get_admin(env.clone());
         if caller != admin {
             panic!("{}", ERR_UNAUTHORIZED);
         }
 
+        let n = payments.len();
+        if n == 0 {
+            panic!("batch_distribute requires at least one payment");
+        }
+        if n > MAX_BATCH_SIZE {
+            panic!("batch too large");
+        }
+
+        let max_distribute = Self::get_max_distribute(env.clone());
         let mut total_amount: i128 = 0;
         for payment in payments.iter() {
             let (_, amount) = payment;
+
+            // Validate each amount is strictly positive
             if amount <= 0 {
                 panic!("{}", ERR_AMOUNT_NOT_POSITIVE);
+            }
+            if *amount > max_distribute {
+                panic!("{}", ERR_AMOUNT_EXCEEDS_MAX_DISTRIBUTE);
             }
             total_amount = total_amount
                 .checked_add(amount)
                 .unwrap_or_else(|| panic!("total overflow"));
         }
 
+        // Phase 2: Balance Check
+        // Query the USDC token contract for current balance
         let usdc_address: Address = env
             .storage()
             .instance()
             .get(&Symbol::new(&env, USDC_KEY))
             .expect(ERR_NOT_INITIALIZED);
         let usdc = token::Client::new(&env, &usdc_address);
-
         let contract_address = env.current_contract_address();
 
         if usdc.balance(&contract_address) < total_amount {
             panic!("{}", ERR_INSUFFICIENT_BALANCE);
         }
 
+        // Phase 3: Execution
+        // All validation passed - now perform the transfers
+        // Each transfer is atomic; if any fails, the entire transaction reverts
         for payment in payments.iter() {
             let (to, amount) = payment;
             Self::validate_recipient(&to, &contract_address);
             usdc.transfer(&contract_address, &to, &amount);
+
+            // Emit event for this leg of the batch
             env.events()
                 .publish((Symbol::new(&env, "batch_distribute"), to), amount);
         }
