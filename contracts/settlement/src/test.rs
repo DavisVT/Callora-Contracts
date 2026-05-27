@@ -2,9 +2,9 @@
 mod settlement_tests {
     extern crate std;
 
-    use crate::{CalloraSettlement, CalloraSettlementClient};
+    use crate::{CalloraSettlement, CalloraSettlementClient, StorageKey};
     use soroban_sdk::testutils::{Address as _, Ledger as _};
-    use soroban_sdk::{Address, Env, Map, Symbol};
+    use soroban_sdk::{Address, Env, Vec};
     use std::any::Any;
     use std::panic::{catch_unwind, AssertUnwindSafe};
 
@@ -45,14 +45,14 @@ mod settlement_tests {
 
         env.as_contract(&addr, || {
             let inst = env.storage().instance();
-            assert!(inst.has(&Symbol::new(&env, "admin")));
-            assert!(inst.has(&Symbol::new(&env, "vault")));
-            assert!(inst.has(&Symbol::new(&env, "developer_balances")));
-            assert!(inst.has(&Symbol::new(&env, "global_pool")));
-            let balances: Map<Address, i128> =
-                inst.get(&Symbol::new(&env, "developer_balances")).unwrap();
+            assert!(inst.has(&StorageKey::Admin));
+            assert!(inst.has(&StorageKey::Vault));
+            assert!(inst.has(&StorageKey::DeveloperIndex));
+            assert!(inst.has(&StorageKey::GlobalPool));
+            let developer_index: Vec<Address> =
+                inst.get(&StorageKey::DeveloperIndex).unwrap();
 
-            assert_eq!(balances.len(), 0);
+            assert_eq!(developer_index.len(), 0);
         });
 
         assert_eq!(client.get_admin(), admin);
