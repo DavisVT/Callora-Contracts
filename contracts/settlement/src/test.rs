@@ -371,7 +371,7 @@ mod settlement_tests {
     }
 
     #[test]
-    fn test_set_vault() {
+    fn test_propose_and_accept_vault_happy_path() {
         let env = Env::default();
         env.mock_all_auths();
         let admin = Address::generate(&env);
@@ -381,12 +381,17 @@ mod settlement_tests {
         let client = CalloraSettlementClient::new(&env, &addr);
         client.init(&admin, &vault);
 
-        client.set_vault(&admin, &new_vault);
+        // Step 1: propose by admin
+        client.propose_vault(&admin, &new_vault);
+        assert_eq!(client.get_vault(), vault); // still old until accepted
+
+        // Step 2: accept by pending vault
+        client.accept_vault(&new_vault);
         assert_eq!(client.get_vault(), new_vault);
     }
 
     #[test]
-    fn test_set_vault_emits_event() {
+    fn test_propose_vault_emits_event() {
         use soroban_sdk::testutils::Events as _;
         use soroban_sdk::{IntoVal, Symbol};
 
@@ -399,7 +404,7 @@ mod settlement_tests {
         let client = CalloraSettlementClient::new(&env, &addr);
         client.init(&admin, &vault);
 
-        client.set_vault(&admin, &new_vault);
+        client.propose_vault(&admin, &new_vault);
 
         let events = env.events().all();
         let ev = events
@@ -407,17 +412,54 @@ mod settlement_tests {
             .find(|e| {
                 !e.1.is_empty() && {
                     let t: Symbol = e.1.get(0).unwrap().into_val(&env);
-                    t == Symbol::new(&env, "vault_changed")
+                    t == Symbol::new(&env, "vault_proposed")
                 }
             })
-            .expect("expected vault_changed event");
+            .expect("expected vault_proposed event");
 
         let topic1: Address = ev.1.get(1).unwrap().into_val(&env);
         assert_eq!(topic1, admin);
 
-        let data: crate::VaultChangedEvent = ev.2.into_val(&env);
+        let data: crate::VaultProposedEvent = ev.2.into_val(&env);
+        assert_eq!(data.current_vault, vault);
+        assert_eq!(data.proposed_vault, new_vault);
+    }
+
+    #[test]
+    fn test_accept_vault_emits_event() {
+        use soroban_sdk::testutils::Events as _;
+        use soroban_sdk::{IntoVal, Symbol};
+
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let vault = Address::generate(&env);
+        let new_vault = Address::generate(&env);
+        let addr = env.register(CalloraSettlement, ());
+        let client = CalloraSettlementClient::new(&env, &addr);
+        client.init(&admin, &vault);
+
+        client.propose_vault(&admin, &new_vault);
+        client.accept_vault(&new_vault);
+
+        let events = env.events().all();
+        let ev = events
+            .iter()
+            .find(|e| {
+                !e.1.is_empty() && {
+                    let t: Symbol = e.1.get(0).unwrap().into_val(&env);
+                    t == Symbol::new(&env, "vault_accepted")
+                }
+            })
+            .expect("expected vault_accepted event");
+
+        let topic1: Address = ev.1.get(1).unwrap().into_val(&env);
+        assert_eq!(topic1, new_vault);
+
+        let data: crate::VaultAcceptedEvent = ev.2.into_val(&env);
         assert_eq!(data.old_vault, vault);
         assert_eq!(data.new_vault, new_vault);
+        assert_eq!(data.accepted_by, new_vault);
     }
 
     // â”€â”€ admin rotation edge cases â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -443,7 +485,7 @@ mod settlement_tests {
 
     #[test]
     fn test_set_vault_to_same_address_succeeds() {
-        // Admin can update vault to same address (no-op but valid)
+        // Admin can propose + accept the same vault (no-op but valid)
         let env = Env::default();
         env.mock_all_auths();
         let admin = Address::generate(&env);
@@ -452,7 +494,8 @@ mod settlement_tests {
         let client = CalloraSettlementClient::new(&env, &addr);
         client.init(&admin, &vault);
 
-        client.set_vault(&admin, &vault);
+        client.propose_vault(&admin, &vault);
+        client.accept_vault(&vault);
         assert_eq!(client.get_vault(), vault);
     }
 
@@ -531,7 +574,8 @@ mod settlement_tests {
         client.accept_admin();
 
         // New admin updates vault
-        client.set_vault(&new_admin, &new_vault);
+        client.propose_vault(&new_admin, &new_vault);
+        client.accept_vault(&new_vault);
         assert_eq!(client.get_vault(), new_vault);
         assert_eq!(client.get_admin(), new_admin);
     }
@@ -695,7 +739,7 @@ mod settlement_tests {
                 total_balance: i128::MAX,
                 last_updated: env.ledger().timestamp(),
             };
-            inst.set(&Symbol::new(&env, "global_pool"), &pool);
+            inst.set(&StorageKey::GlobalPool, &pool);
         });
 
         client.receive_payment(&vault, &1i128, &true, &None);
@@ -714,11 +758,9 @@ mod settlement_tests {
         client.init(&admin, &vault);
 
         env.as_contract(&addr, || {
-            let inst = env.storage().instance();
-            let mut balances: Map<Address, i128> =
-                inst.get(&Symbol::new(&env, "developer_balances")).unwrap();
-            balances.set(developer.clone(), i128::MAX);
-            inst.set(&Symbol::new(&env, "developer_balances"), &balances);
+            env.storage()
+                .persistent()
+                .set(&StorageKey::DeveloperBalance(developer.clone()), &i128::MAX);
         });
 
         client.receive_payment(&vault, &1i128, &false, &Some(developer));
@@ -977,7 +1019,8 @@ mod settlement_tests {
         client.init(&admin, &vault);
 
         // Update vault
-        client.set_vault(&admin, &new_vault);
+        client.propose_vault(&admin, &new_vault);
+        client.accept_vault(&new_vault);
 
         // Old vault cannot send payments
         let result = catch_unwind(AssertUnwindSafe(|| {
@@ -1037,7 +1080,8 @@ mod settlement_tests {
         client.receive_payment(&vault, &100i128, &false, &Some(developer.clone()));
 
         // Update vault
-        client.set_vault(&admin, &new_vault);
+        client.propose_vault(&admin, &new_vault);
+        client.accept_vault(&new_vault);
 
         // More payments from new vault
         client.receive_payment(&new_vault, &150i128, &false, &Some(developer.clone()));
@@ -1164,22 +1208,70 @@ mod settlement_tests {
         let client = CalloraSettlementClient::new(&env, &addr);
         let new_vault = Address::generate(&env);
 
-        // Admin can set vault
-        client.set_vault(&admin, &new_vault);
+        // Admin can propose vault (set_vault is an alias)
+        client.propose_vault(&admin, &new_vault);
 
-        // Vault cannot set vault
+        // Vault cannot propose vault
         let result = catch_unwind(AssertUnwindSafe(|| {
-            client.set_vault(&vault, &new_vault);
+            client.propose_vault(&vault, &new_vault);
         }));
         assert!(result.is_err());
         assert!(panic_message(result.unwrap_err()).contains("unauthorized: caller is not admin"));
 
-        // Third party cannot set vault
+        // Third party cannot propose vault
         let result = catch_unwind(AssertUnwindSafe(|| {
-            client.set_vault(&third_party, &new_vault);
+            client.propose_vault(&third_party, &new_vault);
         }));
         assert!(result.is_err());
         assert!(panic_message(result.unwrap_err()).contains("unauthorized: caller is not admin"));
+    }
+
+    #[test]
+    fn test_accept_vault_rejects_unauthorized_caller() {
+        let (env, addr, admin, vault, third_party) = setup_contract();
+        let client = CalloraSettlementClient::new(&env, &addr);
+        let new_vault = Address::generate(&env);
+
+        client.propose_vault(&admin, &new_vault);
+        assert_eq!(client.get_vault(), vault);
+
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            client.accept_vault(&third_party);
+        }));
+        assert!(result.is_err());
+        assert!(panic_message(result.unwrap_err())
+            .contains("unauthorized: caller must be pending vault or admin"));
+    }
+
+    #[test]
+    fn test_accept_vault_allows_admin_to_finalize() {
+        let (env, addr, admin, vault, _third_party) = setup_contract();
+        let client = CalloraSettlementClient::new(&env, &addr);
+        let new_vault = Address::generate(&env);
+
+        client.propose_vault(&admin, &new_vault);
+        assert_eq!(client.get_vault(), vault);
+
+        client.accept_vault(&admin);
+        assert_eq!(client.get_vault(), new_vault);
+    }
+
+    #[test]
+    fn test_propose_vault_rejects_self_address() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let vault = Address::generate(&env);
+        let addr = env.register(CalloraSettlement, ());
+        let client = CalloraSettlementClient::new(&env, &addr);
+        client.init(&admin, &vault);
+
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            client.propose_vault(&admin, &addr);
+        }));
+        assert!(result.is_err());
+        assert!(panic_message(result.unwrap_err())
+            .contains("invalid config: vault cannot be the contract itself"));
     }
 
     #[test]

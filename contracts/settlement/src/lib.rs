@@ -2,6 +2,9 @@
 
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol, Vec};
 
+/// Maximum number of items accepted by `batch_receive_payment`.
+pub const MAX_BATCH_SIZE: u32 = 50;
+
 /// Persistent storage keys for settlement contract
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -9,6 +12,7 @@ pub enum StorageKey {
     Admin,
     Vault,
     PendingAdmin,
+    PendingVault,
     DeveloperIndex,
     DeveloperBalance(Address),
     GlobalPool,
@@ -56,22 +60,23 @@ pub struct BalanceCreditedEvent {
     pub new_balance: i128,
 }
 
-/// Emitted when the registered vault address is changed via `set_vault()`.
+/// Emitted when a new vault address is proposed via `propose_vault()`.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
-pub struct VaultChangedEvent {
-    pub old_vault: Address,
-    pub new_vault: Address,
+pub struct VaultProposedEvent {
+    pub current_vault: Address,
+    pub proposed_vault: Address,
 }
 
-/// Storage key for the registered vault address.
-const VAULT_KEY: &str = "vault";
-/// Storage key for the admin address.
-const ADMIN_KEY: &str = "admin";
-const PENDING_ADMIN_KEY: &str = "pending_admin";
-const DEVELOPER_BALANCES_KEY: &str = "developer_balances";
-/// Storage key for the global pool state.
-const GLOBAL_POOL_KEY: &str = "global_pool";
+/// Emitted when the proposed vault is accepted via `accept_vault()`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct VaultAcceptedEvent {
+    pub old_vault: Address,
+    pub new_vault: Address,
+    pub accepted_by: Address,
+}
+
 
 #[contract]
 pub struct CalloraSettlement;
@@ -109,10 +114,10 @@ impl CalloraSettlement {
         if vault_address == env.current_contract_address() {
             panic!("invalid config: vault_address cannot be the contract itself");
         }
-        inst.set(&Symbol::new(&env, ADMIN_KEY), &admin);
-        inst.set(&Symbol::new(&env, VAULT_KEY), &vault_address);
-        let empty_balances: Map<Address, i128> = Map::new(&env);
-        inst.set(&Symbol::new(&env, DEVELOPER_BALANCES_KEY), &empty_balances);
+        inst.set(&StorageKey::Admin, &admin);
+        inst.set(&StorageKey::Vault, &vault_address);
+        let empty_index: Vec<Address> = Vec::new(&env);
+        inst.set(&StorageKey::DeveloperIndex, &empty_index);
         let global_pool = GlobalPool {
             total_balance: 0,
             last_updated: env.ledger().timestamp(),
@@ -186,11 +191,11 @@ impl CalloraSettlement {
 
 
             // Read current balance from persistent storage
-            let current_balance = env
+            let current_balance: i128 = env
                 .storage()
                 .persistent()
                 .get(&StorageKey::DeveloperBalance(dev_address.clone()))
-                .unwrap_or(0);
+                .unwrap_or(0i128);
             let new_balance = current_balance
                 .checked_add(amount)
                 .unwrap_or_else(|| panic!("developer balance overflow"));
@@ -209,7 +214,7 @@ impl CalloraSettlement {
             let mut index: Vec<Address> = inst
                 .get(&StorageKey::DeveloperIndex)
                 .unwrap_or_else(|| Vec::new(&env));
-            if !index.iter().any(|addr| addr == &dev_address) {
+            if !index.iter().any(|addr| addr == dev_address) {
                 index.push_back(dev_address.clone());
                 inst.set(&StorageKey::DeveloperIndex, &index);
             }
@@ -274,17 +279,33 @@ impl CalloraSettlement {
         }
 
         let inst = env.storage().instance();
-        let mut balances: Map<Address, i128> = inst
-            .get(&Symbol::new(&env, DEVELOPER_BALANCES_KEY))
-            .unwrap_or_else(|| Map::new(&env));
-
         for item in items.iter() {
             let (dev, amount) = item;
-            let current = balances.get(dev.clone()).unwrap_or(0);
-            let new_balance = current
+            let current: i128 = env
+                .storage()
+                .persistent()
+                .get(&StorageKey::DeveloperBalance(dev.clone()))
+                .unwrap_or(0i128);
+            let new_balance: i128 = current
                 .checked_add(amount)
                 .unwrap_or_else(|| panic!("developer balance overflow"));
-            balances.set(dev.clone(), new_balance);
+
+            env.storage()
+                .persistent()
+                .set(&StorageKey::DeveloperBalance(dev.clone()), &new_balance);
+            env.storage()
+                .persistent()
+                .extend_ttl(&StorageKey::DeveloperBalance(dev.clone()), 50000, 50000);
+
+            // Add developer to index if not already present
+            let mut index: Vec<Address> = inst
+                .get(&StorageKey::DeveloperIndex)
+                .unwrap_or_else(|| Vec::new(&env));
+            if !index.iter().any(|addr| addr == dev) {
+                index.push_back(dev.clone());
+                inst.set(&StorageKey::DeveloperIndex, &index);
+            }
+
             env.events().publish(
                 (Symbol::new(&env, "balance_credited"), dev.clone()),
                 BalanceCreditedEvent {
@@ -294,8 +315,6 @@ impl CalloraSettlement {
                 },
             );
         }
-
-        inst.set(&Symbol::new(&env, DEVELOPER_BALANCES_KEY), &balances);
     }
 
     /// Get current admin address
@@ -392,11 +411,12 @@ impl CalloraSettlement {
         
         let mut result = Vec::new(&env);
         for address in index.iter() {
-            let balance = env
+            let address_key = address.clone();
+            let balance: i128 = env
                 .storage()
                 .persistent()
-                .get(&StorageKey::DeveloperBalance(address))
-                .unwrap_or(0);
+                .get(&StorageKey::DeveloperBalance(address_key))
+                .unwrap_or(0i128);
             result.push_back(DeveloperBalance {
                 address: address.clone(),
                 balance,
@@ -478,7 +498,7 @@ impl CalloraSettlement {
             .publish((Symbol::new(&env, "admin_accepted"), current, pending), ());
     }
 
-    /// Update vault address (admin only).
+    /// Propose a new vault address (admin only).
     ///
     /// # Arguments
     /// * `caller` - Current admin address; must match stored admin
@@ -487,32 +507,83 @@ impl CalloraSettlement {
     /// # Access Control
     /// Only the current admin can call this function.
     ///
+    pub fn set_vault(env: Env, caller: Address, new_vault: Address) {
+        // Backwards-compatible alias: `set_vault` now behaves like `propose_vault`.
+        Self::propose_vault(env, caller, new_vault);
+    }
+
+    /// Propose a new vault address (admin only).
+    ///
+    /// This is the first step of a two-step vault rotation:
+    /// 1. Admin calls `propose_vault()` to set `PendingVault`
+    /// 2. Proposed vault (or admin) calls `accept_vault()` to activate it
+    ///
     /// # Security
-    /// The vault address controls which contract can send payments to
-    /// the settlement contract. Only trusted addresses should be set.
-    /// Changing the vault address immediately revokes access from the
-    /// old vault, so coordinate carefully during migrations.
+    /// This prevents a typo from instantly routing settlement credits to the wrong contract.
     ///
     /// # Events
-    /// Emits `vault_changed` event with the old and new vault addresses.
+    /// Emits `vault_proposed` with current and proposed vault addresses.
     ///
     /// # Panics
-    /// Panics if caller is not the current admin.
-    pub fn set_vault(env: Env, caller: Address, new_vault: Address) {
+    /// - `"unauthorized: caller is not admin"` if caller is not admin
+    /// - `"invalid config: vault cannot be the contract itself"` if proposed vault is this contract
+    pub fn propose_vault(env: Env, caller: Address, new_vault: Address) {
         caller.require_auth();
         let current_admin = Self::get_admin(env.clone());
         if caller != current_admin {
             panic!("unauthorized: caller is not admin");
         }
+        if new_vault == env.current_contract_address() {
+            panic!("invalid config: vault cannot be the contract itself");
+        }
+
         let inst = env.storage().instance();
-        let old_vault = Self::get_vault(env.clone());
-        inst.set(&Symbol::new(&env, VAULT_KEY), &new_vault);
+        let current_vault = Self::get_vault(env.clone());
+        inst.set(&StorageKey::PendingVault, &new_vault);
 
         env.events().publish(
-            (Symbol::new(&env, "vault_changed"), caller.clone()),
-            VaultChangedEvent {
-                old_vault: old_vault.clone(),
-                new_vault: new_vault.clone(),
+            (Symbol::new(&env, "vault_proposed"), caller),
+            VaultProposedEvent {
+                current_vault,
+                proposed_vault: new_vault,
+            },
+        );
+    }
+
+    /// Accept the proposed vault and activate it.
+    ///
+    /// # Arguments
+    /// * `caller` - Must be either the proposed vault address or the admin.
+    ///
+    /// # Events
+    /// Emits `vault_accepted` with old vault, new vault, and acceptor.
+    ///
+    /// # Panics
+    /// - `"no vault rotation pending"` if no `propose_vault()` was called
+    /// - `"unauthorized: caller must be pending vault or admin"` if caller is neither
+    pub fn accept_vault(env: Env, caller: Address) {
+        caller.require_auth();
+
+        let inst = env.storage().instance();
+        let pending: Address = inst
+            .get(&StorageKey::PendingVault)
+            .unwrap_or_else(|| panic!("no vault rotation pending"));
+
+        let admin = Self::get_admin(env.clone());
+        if caller != pending && caller != admin {
+            panic!("unauthorized: caller must be pending vault or admin");
+        }
+
+        let old_vault = Self::get_vault(env.clone());
+        inst.set(&StorageKey::Vault, &pending);
+        inst.remove(&StorageKey::PendingVault);
+
+        env.events().publish(
+            (Symbol::new(&env, "vault_accepted"), caller.clone()),
+            VaultAcceptedEvent {
+                old_vault,
+                new_vault: pending,
+                accepted_by: caller,
             },
         );
     }
